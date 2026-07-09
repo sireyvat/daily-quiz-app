@@ -1,46 +1,10 @@
 """
 =====================================================================
- DAILY QUIZ WEB APP  -  Streamlit + Google Sheets + Telegram Mini App
-=====================================================================
-Author  : Claude (Anthropic)
-Purpose : A mobile-friendly quiz app, opened inside a Telegram Group
-          as a Web App link (Telegram Mini App).
-
-Version 2 changes
-------------------
-- Questions are NO LONGER hardcoded. They are fetched live from a
-  Google Sheet worksheet named "Questions".
-- Results are appended to a separate worksheet named "Results" in
-  the SAME spreadsheet.
-- A single gspread service account connection (cached) is reused for
-  both reading questions and writing results.
-- Question fetching is cached with @st.cache_data(ttl=60) so rapid
-  button clicks within the same quiz don't re-hit the Sheets API,
-  while still refreshing at most once a minute so new/edited
-  questions show up for new attempts without a redeploy.
-
-Google Sheet structure required
---------------------------------
-Spreadsheet name: "Daily Quiz Results"  (change SPREADSHEET_NAME below
-to match yours)
-
-Tab 1 - "Questions"
-    Row 1 (header): Question | Options | Correct Answer
-    Row 2+: one question per row.
-      - "Options" holds ALL choices in a single cell, comma-separated,
-        e.g.:  23, 25, 15, 26
-      - "Correct Answer" must exactly match (after trimming spaces)
-        one of the values inside "Options".
-    Any number of options per question is fine (2, 3, 4, 5...) since
-    they're simply split on commas.
-
-Tab 2 - "Results"
-    Row 1 (header): Timestamp | Student Name | Class | Score
-    The app only appends rows here; you don't need to pre-fill it
-    beyond the header row.
-
-Run locally:
-    streamlit run app.py
+  DAILY QUIZ WEB APP  -  Streamlit + Google Sheets + Telegram Mini App
+ 
+  កូដដែលបានកែសម្រួលនិងកែលម្អ៖ Version 3.1 (ភាសាខ្មែររលូន ១០០%)
+  គោលបំណង: ឆ្លើយសំណួរ ដោយទាញទិន្នន័យផ្ទាល់ពី Google Sheets 
+  លក្ខណៈពិសេស៖ លុបចន្លោះដកឃ្លា (Trim) ស្វ័យប្រវត្ត ដើម្បីការពារ Error
 =====================================================================
 """
 
@@ -48,6 +12,7 @@ import streamlit as st
 import random
 import time
 import uuid
+import os
 from datetime import datetime
 
 try:
@@ -57,9 +22,8 @@ try:
 except ImportError:
     GSPREAD_AVAILABLE = False
 
-
 # =====================================================================
-# 1. PAGE CONFIG  (must be the first Streamlit command)
+# 1. PAGE CONFIG (ត្រូវដាក់ដំបូងគេបង្អស់)
 # =====================================================================
 st.set_page_config(
     page_title="Daily Quiz",
@@ -126,18 +90,26 @@ st.markdown(
             text-align: center;
             margin-bottom: 0.5rem;
         }
+        .debug-box {
+            background-color: #fff3cd;
+            color: #856404;
+            padding: 1rem;
+            border-radius: 10px;
+            border-left: 4px solid #ffc107;
+            margin-top: 1rem;
+            font-size: 0.9rem;
+        }
     </style>
     """,
     unsafe_allow_html=True,
 )
 
-
 # =====================================================================
-# 3. CONFIG — change these to match your Google Sheet
+# 3. ⚙️ CONFIG - ការកំណត់ឈ្មោះសន្លឹកកិច្ចការ
 # =====================================================================
-SPREADSHEET_NAME = "Daily Quiz Results"   # <-- your Google Sheet's name
-QUESTIONS_TAB = "Questions"               # <-- tab with the question bank
-RESULTS_TAB = "Results"                   # <-- tab to log student scores
+SPREADSHEET_NAME = "Daily Quiz Results"   # ➜ ឈ្មោះ Google Sheet
+QUESTIONS_TAB = "Questions"               # ➜ Tab សម្រាប់ដាក់សំណួរ
+RESULTS_TAB = "Results"                   # ➜ Tab សម្រាប់រក្សាទុកពិន្ទុ
 QUESTIONS_PER_ATTEMPT = 3
 
 GOOGLE_SCOPES = [
@@ -145,79 +117,35 @@ GOOGLE_SCOPES = [
     "https://www.googleapis.com/auth/drive",
 ]
 
-
 # =====================================================================
-# 4. GOOGLE SHEETS CONNECTION (cached — one client per app lifetime)
+# 4. GOOGLE SHEETS CONNECTION - ការភ្ជាប់ទៅ Google Sheets
 # =====================================================================
 @st.cache_resource(show_spinner=False)
 def get_gspread_client():
-    """
-    Builds and caches an authorized gspread client from the service
-    account credentials stored in Streamlit secrets.
-
-    SETUP INSTRUCTIONS:
-    --------------------------------------------------------------
-    1. Go to https://console.cloud.google.com/ and create a project.
-    2. Enable the "Google Sheets API" and "Google Drive API".
-    3. Create a Service Account -> generate a JSON key file.
-    4. Share your Google Sheet (both tabs live in the SAME sheet)
-       with the service account's email (the "client_email" field
-       inside the JSON key), giving it "Editor" access.
-    5. In Streamlit Community Cloud: App -> Settings -> Secrets, paste:
-
-           [gcp_service_account]
-           type = "service_account"
-           project_id = "..."
-           private_key_id = "..."
-           private_key = "-----BEGIN PRIVATE KEY-----\n...\n-----END PRIVATE KEY-----\n"
-           client_email = "...@....iam.gserviceaccount.com"
-           client_id = "..."
-           token_uri = "https://oauth2.googleapis.com/token"
-
-       (For local testing, put the same block in .streamlit/secrets.toml)
-    --------------------------------------------------------------
-    Returns None if gspread isn't installed or secrets aren't configured,
-    so the rest of the app can degrade gracefully instead of crashing.
-    """
     if not GSPREAD_AVAILABLE:
+        st.error("❌ មិនទាន់បានដំឡើង gspread ឡើយ។ សូមរត់ពាក្យបញ្ជា: pip install gspread google-auth")
         return None
+    
     if "gcp_service_account" not in st.secrets:
+        st.error(
+            "❌ រកមិនឃើញកូដសម្ងាត់ (JSON Key) នៅក្នុង Streamlit Secrets ឡើយ!\n\n"
+            "សូមចូលទៅកាន់៖ App → Settings → Secrets រួចបិទភ្ជាប់កូដសម្ងាត់របស់លោកគ្រូចូល។"
+        )
         return None
 
     try:
         creds_dict = dict(st.secrets["gcp_service_account"])
         creds = Credentials.from_service_account_info(creds_dict, scopes=GOOGLE_SCOPES)
         client = gspread.authorize(creds)
+        st.session_state._gspread_client = client
         return client
     except Exception as e:
-        st.error(f"Failed to authorize Google Sheets client: {e}")
+        st.error(f"❌ ការភ្ជាប់ទៅ Google Sheets បរាជ័យ: {str(e)}")
         return None
 
 
-@st.cache_data(ttl=60, show_spinner=False)
+@st.cache_data(ttl=10, show_spinner=False)
 def fetch_question_bank():
-    """
-    Reads every row from the "Questions" worksheet and returns a list
-    of dicts:
-        {"question": str, "options": [opt1, opt2, ...], "answer": str}
-
-    Matches THIS sheet layout exactly:
-        Column A: Question
-        Column B: Options        <- comma-separated, e.g. "23, 25, 15, 26"
-        Column C: Correct Answer <- must match one of the split options
-
-    The number of options per question is flexible (2, 3, 4, 5...) since
-    they're just split on commas — it doesn't have to be exactly 4.
-
-    Cached for 60 seconds (ttl=60) so:
-    - Rapid reruns during a single quiz (e.g. clicking an answer)
-      don't re-hit the Sheets API.
-    - Edits made to the Questions tab (add/remove/change questions)
-      are picked up automatically within a minute for any NEW
-      attempt, with no redeploy needed.
-
-    Returns an empty list on any failure — callers must handle that.
-    """
     client = get_gspread_client()
     if client is None:
         return []
@@ -225,72 +153,108 @@ def fetch_question_bank():
     try:
         sheet = client.open(SPREADSHEET_NAME)
         worksheet = sheet.worksheet(QUESTIONS_TAB)
-        records = worksheet.get_all_records()  # list of dicts keyed by header row
+        records = worksheet.get_all_records()
+        st.session_state._last_fetch_status = f"✅ ទាញយកបានជោគជ័យ ចំនួន {len(records)} សំណួរ"
+        
+    except gspread.exceptions.WorksheetNotFound:
+        st.session_state._last_fetch_error = (
+            f"❌ រកមិនឃើញ Tab ដែលមានឈ្មោះថា '{QUESTIONS_TAB}' ឡើយ!\n"
+            f"📝 សូមពិនិត្យមើលឈ្មោះ Tab នៅក្នុង Google Sheet ឡើងវិញ។"
+        )
+        return []
+    except gspread.exceptions.SpreadsheetNotFound:
+        st.session_state._last_fetch_error = (
+            f"❌ រកមិនឃើញហ្វាយ Google Sheet ដែលមានឈ្មោះថា '{SPREADSHEET_NAME}' ឡើយ!\n"
+            f"📝 សូមប្រាកដថាបានដាក់ឈ្មោះហ្វាយត្រូវ និងបាន Share ទៅកាន់ Service Account រួចរាល់។"
+        )
+        return []
     except Exception as e:
-        st.session_state["_fetch_error"] = str(e)
+        st.session_state._last_fetch_error = f"❌ កំហុសប្រព័ន្ធ API: {str(e)}"
         return []
 
     bank = []
-    for row in records:
+    errors = []
+    
+    for idx, row in enumerate(records, start=2):
         try:
-            question_text = str(row["Question"]).strip()
-            options_raw = str(row["Options"])
-            answer = str(row["Correct Answer"]).strip()
-        except KeyError:
-            # Row/header mismatch — skip malformed row instead of crashing.
+            question = str(row.get("Question", "")).strip()
+            options_raw = str(row.get("Options", ""))
+            answer = str(row.get("Correct Answer", "")).strip()
+            
+            if not question:
+                errors.append(f"ជួរដេក (Row) {idx}: ប្រអប់សំណួរទទេ")
+                continue
+            
+            if not options_raw.strip():
+                errors.append(f"ជួរដេក (Row) {idx}: ប្រអប់ជម្រើសចម្លើយទទេ")
+                continue
+            
+            # បំបែកចម្លើយដោយប្រើសញ្ញាក្បៀស និងលុបដកឃ្លាចេញឱ្យអស់ (Strict Trimming)
+            options = [opt.strip() for opt in options_raw.split(",") if opt.strip()]
+            
+            if len(options) < 2:
+                errors.append(f"ជួរដេក (Row) {idx}: ត្រូវការជម្រើសចម្លើយយ៉ាងតិច ២ ប៉ុន្តែរកឃើញតែ {len(options)}")
+                continue
+            
+            # ប្រៀបធៀបដោយលុបដកឃ្លាចេញពីចម្លើយត្រឹមត្រូវដូចគ្នា
+            if answer not in options:
+                errors.append(f"ជួរដេក (Row) {idx}: ចម្លើយពិតប្រាកដ '{answer}' មិនត្រូវគ្នាជាមួយជម្រើសឡើយ")
+                continue
+            
+            bank.append({
+                "question": question,
+                "options": options,
+                "answer": answer,
+            })
+            
+        except KeyError as e:
+            errors.append(f"ជួរដេក (Row) {idx}: រកមិនឃើញចំណងជើងជួរឈរ (Headers) - {str(e)}")
             continue
-
-        # Split the single "Options" cell on commas into a clean list,
-        # e.g. "23, 25, 15, 26" -> ["23", "25", "15", "26"]
-        options = [opt.strip() for opt in options_raw.split(",") if opt.strip() != ""]
-
-        # Skip incomplete/malformed rows: blank question, fewer than 2
-        # options, or an answer that doesn't exactly match one of them.
-        if not question_text or len(options) < 2 or answer not in options:
+        except Exception as e:
+            errors.append(f"ជួរដេក (Row) {idx}: មានបញ្ហា - {str(e)}")
             continue
-
-        bank.append({
-            "question": question_text,
-            "options": options,
-            "answer": answer,
-        })
-
+    
+    st.session_state._question_errors = errors
+    
+    if not bank:
+        st.session_state._last_fetch_error = (
+            "❌ មិនមានសំណួរណាមួយត្រឹមត្រូវតាមលក្ខខណ្ឌឡើយ!\n"
+            "📋 សូមពិនិត្យមើល Headers ក្នុង Google Sheet ត្រូវតែមាន៖\n"
+            "   • Question | Options | Correct Answer"
+        )
+    
     return bank
 
 
-def log_result_to_sheet(student_name: str, student_class: str, score: int, total: int) -> bool:
-    """Appends [Timestamp, Student Name, Class, Score] to the 'Results' tab."""
+def log_result_to_sheet(student_name: str, student_class: str, score: int, total: int):
     client = get_gspread_client()
     if client is None:
         return False
 
     try:
         sheet = client.open(SPREADSHEET_NAME)
-        worksheet = sheet.worksheet(RESULTS_TAB)
+        try:
+            worksheet = sheet.worksheet(RESULTS_TAB)
+        except gspread.exceptions.WorksheetNotFound:
+            worksheet = sheet.add_worksheet(title=RESULTS_TAB, rows="1000", cols="4")
+            worksheet.insert_row(["Timestamp", "Student Name", "Class", "Score"], 1)
+        
         timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         worksheet.append_row([timestamp, student_name, student_class, f"{score}/{total}"])
         return True
+        
     except Exception as e:
-        st.error(f"Could not save your result to Google Sheets. (Error: {e})")
+        st.session_state._log_error = str(e)
         return False
 
 
 # =====================================================================
-# 5. ANTI-CHEAT / SESSION MANAGEMENT
-#
-#    Every fresh visit gets a unique "session_token" stored both in
-#    st.session_state AND in the URL query params. If they don't
-#    match (hard refresh wiped session_state, but the old URL still
-#    carries the old sid), we treat it as a NEW attempt: fresh
-#    questions re-fetched from the sheet, score reset to zero.
+# 5. SESSION MANAGEMENT - ការគ្រប់គ្រងវគ្គការងារ
 # =====================================================================
 def start_new_attempt():
-    """Resets all quiz state and pulls a fresh randomized question set
-    live from the Google Sheet."""
     new_token = str(uuid.uuid4())
-
     st.session_state.session_token = new_token
-    st.session_state.stage = "login"          # login -> quiz -> result
+    st.session_state.stage = "login"
     st.session_state.student_name = ""
     st.session_state.student_class = ""
     st.session_state.current_q_index = 0
@@ -298,27 +262,20 @@ def start_new_attempt():
     st.session_state.answered_current = False
     st.session_state.last_answer_correct = None
     st.session_state.logged = False
-    st.session_state.quiz_questions = []       # filled in once student logs in
-
+    st.session_state.quiz_questions = []
     st.query_params["sid"] = new_token
 
 
 def prepare_quiz_questions():
-    """
-    Fetches the live question bank from the Google Sheet, randomly
-    picks QUESTIONS_PER_ATTEMPT questions, and shuffles each
-    question's options. Called once, right after login.
-    """
     full_bank = fetch_question_bank()
-
     if not full_bank:
-        st.session_state.quiz_questions = []
         return False
 
+    # ប្រព័ន្ធឆ្លាតវៃ៖ បើមានសំណួរតិចជាងលក្ខខណ្ឌ ក៏នៅតែទាញយកមកប្រឡងបានដែរ (មិនគាំងទេ)
     n = min(QUESTIONS_PER_ATTEMPT, len(full_bank))
     selected = random.sample(full_bank, n)
-
     prepared = []
+    
     for q in selected:
         opts = q["options"][:]
         random.shuffle(opts)
@@ -333,10 +290,7 @@ def prepare_quiz_questions():
 
 
 def ensure_valid_session():
-    """Called at the top of every rerun. Detects refresh/reopen and
-    forces a brand-new attempt when needed."""
     url_sid = st.query_params.get("sid", None)
-
     if "session_token" not in st.session_state:
         start_new_attempt()
     else:
@@ -345,36 +299,35 @@ def ensure_valid_session():
 
 
 # =====================================================================
-# 6. UI SCREENS
+# 6. UI SCREENS - ការបង្ហាញផ្ទាំងកម្មវិធី
 # =====================================================================
 def render_login_screen():
     st.markdown("<h1 class='quiz-header'>🧠 Daily Quiz</h1>", unsafe_allow_html=True)
     st.markdown(
-        "<p style='text-align:center; color:#666;'>Answer a few quick questions. "
-        "Good luck!</p>",
+        "<p style='text-align:center; color:#666;'>សូមស្វាគមន៍មកកាន់ការវាយតម្លៃចំណេះដឹង! 💪</p>",
         unsafe_allow_html=True,
     )
     st.divider()
 
     with st.form("login_form", clear_on_submit=False):
-        name = st.text_input("Full Name", placeholder="e.g. Sophea Chan")
-        student_class = st.text_input("Class / Grade", placeholder="e.g. Grade 10A")
-        submitted = st.form_submit_button("Start Quiz 🚀", use_container_width=True)
+        name = st.text_input("📝 ឈ្មោះពេញរបស់អ្នកសិក្សា", placeholder="ឧ: សុផា ច័ន្ទ")
+        student_class = st.text_input("📚 ថ្នាក់ ឬ ក្រុម", placeholder="ឧ: ថ្នាក់ទី ១០ក")
+        submitted = st.form_submit_button("ចាប់ផ្តើមធ្វើកម្រងសំណួរ 🚀", use_container_width=True)
 
         if submitted:
             if not name.strip() or not student_class.strip():
-                st.error("Please fill in both your Full Name and Class/Grade.")
+                st.error("⚠️ សូមបំពេញឈ្មោះ និងថ្នាក់ឱ្យបានត្រឹមត្រូវជាមុនសិន។")
                 return
 
-            with st.spinner("Fetching today's questions..."):
+            with st.spinner("📥 កំពុងទាញយកសំណួរពីប្រព័ន្ធ..."):
                 ok = prepare_quiz_questions()
 
             if not ok:
-                st.error(
-                    "Couldn't load questions right now. Please check that the "
-                    "'Questions' worksheet is set up correctly, or try again "
-                    "in a moment."
-                )
+                st.error(st.session_state.get("_last_fetch_error", "❌ ការទាញយកសំណួរបរាជ័យ។ សូមព្យាយាមម្តងទៀត។"))
+                
+                # បង្ហាញព័ត៌មានលម្អិតពីកំហុស (Debug)
+                if st.checkbox("🔧 បើកមើលព័ត៌មានកំហុស (Debug Info)"):
+                    st.write("បញ្ហានៅលើជួរដេក៖", st.session_state.get("_question_errors", []))
                 return
 
             st.session_state.student_name = name.strip()
@@ -385,10 +338,9 @@ def render_login_screen():
 
 def render_quiz_screen():
     questions = st.session_state.quiz_questions
-
     if not questions:
-        st.error("No questions are loaded for this attempt. Please restart.")
-        if st.button("Restart"):
+        st.error("❌ មិនមានសំណួរនៅក្នុងប្រព័ន្ធឡើយ។ សូមចាប់ផ្តើមឡើងវិញ។")
+        if st.button("🔄 ចាប់ផ្តើមម្តងទៀត"):
             start_new_attempt()
             st.rerun()
         return
@@ -396,7 +348,7 @@ def render_quiz_screen():
     idx = st.session_state.current_q_index
     total = len(questions)
 
-    st.progress(idx / total, text=f"Question {idx + 1} of {total}")
+    st.progress(idx / total, text=f"សំណួរទី {idx + 1} ក្នុងចំណោម {total}")
 
     q = questions[idx]
     st.markdown(f"### {q['question']}")
@@ -404,7 +356,7 @@ def render_quiz_screen():
     if not st.session_state.answered_current:
         for option in q["options"]:
             if st.button(option, key=f"opt_{idx}_{option}", use_container_width=True):
-                is_correct = option == q["answer"]
+                is_correct = option.strip() == q["answer"].strip()
                 st.session_state.answered_current = True
                 st.session_state.last_answer_correct = is_correct
                 if is_correct:
@@ -420,14 +372,10 @@ def render_quiz_screen():
             )
 
         if st.session_state.last_answer_correct:
-            st.markdown(
-                "<div class='feedback-correct'>✅ Correct!</div>",
-                unsafe_allow_html=True,
-            )
+            st.markdown("<div class='feedback-correct'>✅ ត្រឹមត្រូវ! កោតសរសើរ។</div>", unsafe_allow_html=True)
         else:
             st.markdown(
-                f"<div class='feedback-incorrect'>❌ Incorrect. "
-                f"Correct answer: <b>{q['answer']}</b></div>",
+                f"<div class='feedback-incorrect'>❌ មិនត្រឹមត្រូវទេ! ចម្លើយដែលត្រូវគឺ៖ <b>{q['answer']}</b></div>",
                 unsafe_allow_html=True,
             )
 
@@ -448,17 +396,17 @@ def render_result_screen():
     total = len(st.session_state.quiz_questions)
 
     st.balloons()
-    st.markdown("<h1 class='quiz-header'>🎉 Quiz Complete!</h1>", unsafe_allow_html=True)
+    st.markdown("<h1 class='quiz-header'>🎉 បញ្ចប់ការធ្វើតេស្ត!</h1>", unsafe_allow_html=True)
 
     st.markdown(
         f"""
         <div style='text-align:center; padding: 1.2rem; background:#f0f2f6;
                     border-radius: 14px; margin-top: 1rem;'>
             <p style='font-size:1.1rem; margin-bottom:0.3rem;'>
-                {st.session_state.student_name} ({st.session_state.student_class})
+                ឈ្មោះ៖ {st.session_state.student_name} ({st.session_state.student_class})
             </p>
             <p style='font-size:2.2rem; font-weight:700; margin:0;'>
-                {score} / {total}
+                ទទួលបានពិន្ទុ៖ {score} / {total}
             </p>
         </div>
         """,
@@ -474,29 +422,27 @@ def render_result_screen():
         )
         st.session_state.logged = True
         if success:
-            st.success("✅ Your score has been recorded. You may close this window.")
+            st.success("✅ លទ្ធផលរបស់អ្នកសិក្សាត្រូវបានរក្សាទុកក្នុងប្រព័ន្ធរួចរាល់។ លោកអ្នកអាចបិទផ្ទាំងនេះបាន។")
         else:
             st.info(
-                "Your score was calculated, but could not be saved automatically. "
-                "Please inform your teacher of your score above."
+                "⚠️ លទ្ធផលមិនអាចរក្សាទុកដោយស្វ័យប្រវត្តបានឡើយ។ "
+                "សូមថតរូបអេក្រង់ពិន្ទុនេះផ្ញើជូនលោកគ្រូ៖ " + str(score) + "/" + str(total)
             )
     else:
-        st.success("✅ Your score has been recorded. You may close this window.")
+        st.success("✅ លទ្ធផលត្រូវបានរក្សាទុកក្នុងប្រព័ន្ធរួចរាល់។")
 
     st.divider()
     st.caption(
-        "Note: Refreshing or reopening this link will start a brand-new "
-        "quiz attempt with new random questions — your previous score "
-        "stays recorded."
+        "💡 ចំណាំ៖ ប្រសិនបើលោកអ្នកធ្វើការ Refresh ទំព័រនេះ ឬបើកលីងម្តងទៀត "
+        "វានឹងចាប់ផ្តើមការប្រឡងថ្មីមួយទៀតដែលមានសំណួរផ្លាស់ប្តូរចៃដន្យ ដោយឡែកលទ្ធផលចាស់នៅតែរក្សាទុកដដែល។"
     )
 
 
 # =====================================================================
-# 7. MAIN APP FLOW
+# 7. MAIN APP FLOW - ដំណើរការកម្មវិធីចម្បង
 # =====================================================================
 def main():
     ensure_valid_session()
-
     stage = st.session_state.get("stage", "login")
 
     if stage == "login":
