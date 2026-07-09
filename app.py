@@ -25,9 +25,14 @@ Spreadsheet name: "Daily Quiz Results"  (change SPREADSHEET_NAME below
 to match yours)
 
 Tab 1 - "Questions"
-    Row 1 (header): Question | Option1 | Option2 | Option3 | Option4 | Answer
-    Row 2+: one question per row. "Answer" must exactly match the text
-    in one of Option1..Option4 (case-sensitive match is used).
+    Row 1 (header): Question | Options | Correct Answer
+    Row 2+: one question per row.
+      - "Options" holds ALL choices in a single cell, comma-separated,
+        e.g.:  23, 25, 15, 26
+      - "Correct Answer" must exactly match (after trimming spaces)
+        one of the values inside "Options".
+    Any number of options per question is fine (2, 3, 4, 5...) since
+    they're simply split on commas.
 
 Tab 2 - "Results"
     Row 1 (header): Timestamp | Student Name | Class | Score
@@ -194,7 +199,15 @@ def fetch_question_bank():
     """
     Reads every row from the "Questions" worksheet and returns a list
     of dicts:
-        {"question": str, "options": [opt1, opt2, opt3, opt4], "answer": str}
+        {"question": str, "options": [opt1, opt2, ...], "answer": str}
+
+    Matches THIS sheet layout exactly:
+        Column A: Question
+        Column B: Options        <- comma-separated, e.g. "23, 25, 15, 26"
+        Column C: Correct Answer <- must match one of the split options
+
+    The number of options per question is flexible (2, 3, 4, 5...) since
+    they're just split on commas — it doesn't have to be exactly 4.
 
     Cached for 60 seconds (ttl=60) so:
     - Rapid reruns during a single quiz (e.g. clicking an answer)
@@ -221,20 +234,19 @@ def fetch_question_bank():
     for row in records:
         try:
             question_text = str(row["Question"]).strip()
-            options = [
-                str(row["Option1"]).strip(),
-                str(row["Option2"]).strip(),
-                str(row["Option3"]).strip(),
-                str(row["Option4"]).strip(),
-            ]
-            answer = str(row["Answer"]).strip()
+            options_raw = str(row["Options"])
+            answer = str(row["Correct Answer"]).strip()
         except KeyError:
             # Row/header mismatch — skip malformed row instead of crashing.
             continue
 
-        # Skip incomplete rows (blank question, missing options/answer,
-        # or an answer that doesn't match any of the 4 options).
-        if not question_text or any(o == "" for o in options) or answer not in options:
+        # Split the single "Options" cell on commas into a clean list,
+        # e.g. "23, 25, 15, 26" -> ["23", "25", "15", "26"]
+        options = [opt.strip() for opt in options_raw.split(",") if opt.strip() != ""]
+
+        # Skip incomplete/malformed rows: blank question, fewer than 2
+        # options, or an answer that doesn't exactly match one of them.
+        if not question_text or len(options) < 2 or answer not in options:
             continue
 
         bank.append({
@@ -338,7 +350,7 @@ def ensure_valid_session():
 def render_login_screen():
     st.markdown("<h1 class='quiz-header'>🧠 Daily Quiz</h1>", unsafe_allow_html=True)
     st.markdown(
-        "<p style='text-align:center; color:#666;'>Answer 3 quick questions. "
+        "<p style='text-align:center; color:#666;'>Answer a few quick questions. "
         "Good luck!</p>",
         unsafe_allow_html=True,
     )
