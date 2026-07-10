@@ -2,3 +2,6 @@ streamlit>=1.35.0
 gspread>=6.0.0
 google-auth>=2.29.0
 pytz>=2023.3
+streamlit-autorefresh>=0.1.0
+streamlit-mic-recorder>=0.0.8
+pydub>=0.25.1
