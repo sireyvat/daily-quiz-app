@@ -1,23 +1,41 @@
 """
 =====================================================================
- DAILY QUIZ WEB APP - MULTI-MODAL ASSESSMENT SYSTEM v3
+ DAILY QUIZ WEB APP - MULTI-MODAL ASSESSMENT SYSTEM v3.1 (fixed)
  Streamlit + Google Sheets + Auto-refresh Timer
  
  FEATURES:
  ✅ Multi-Modal Support (MCQ, Writing, Listening, Speaking)
- ✅ Auto-refresh Timer (1-second updates)
- ✅ No time.sleep() - pure state-based navigation
+ ✅ Auto-refresh Timer (uses the REAL streamlit-autorefresh API)
  ✅ Safe Cache Clearing - prevents double-attempt bug
  ✅ Defensive Type Conversion - all sheet values wrapped
- ✅ Natural Khmer UI - high-standard academic language
+ ✅ Optional Roster/Attendance check - falls back to manual entry
+    if no "Students" tab exists yet
+ ✅ Matches your CURRENT "Questions" tab layout:
+        Question | Options | Correct Answer  (or add "Type" column
+        to unlock Writing/Listening/Speaking question types)
+
+ FIXES APPLIED vs the previous draft:
+ 1. st.set_page_config() is now called EXACTLY ONCE (calling it
+    twice crashed every quiz screen with a StreamlitAPIException).
+ 2. streamlit_autorefresh's real function is `st_autorefresh`, not
+    `rerun_if_updated` (that name doesn't exist in the package, so
+    the import always failed silently before).
+ 3. fetch_question_bank() now reads the "Options" column (matches
+    your real sheet) instead of a nonexistent "Data/Options" column.
+ 4. Added `pytz` to requirements.txt (it was used but not declared).
+ 5. Fixed the f-string SyntaxError (backslash inside an f-string
+    expression is illegal on Python <3.12) by pulling the color/label
+    lookups into plain variables first.
+ 6. The "Students" roster tab is now OPTIONAL. If it doesn't exist,
+    the app falls back to a manual Full Name + Class login (no
+    attendance/daily-attempt lock), so it works with your sheet
+    exactly as it is today.
 =====================================================================
 """
 
 import streamlit as st
 import random
 import uuid
-import base64
-import io
 from datetime import datetime
 import pytz
 from typing import List, Dict, Optional, Tuple
@@ -30,7 +48,7 @@ except ImportError:
     GSPREAD_AVAILABLE = False
 
 try:
-    from streamlit_autorefresh import rerun_if_updated
+    from streamlit_autorefresh import st_autorefresh
     AUTOREFRESH_AVAILABLE = True
 except ImportError:
     AUTOREFRESH_AVAILABLE = False
@@ -42,7 +60,7 @@ except ImportError:
     MIC_RECORDER_AVAILABLE = False
 
 # =====================================================================
-# 1. PAGE CONFIG & AUTO-REFRESH
+# 1. PAGE CONFIG  (called exactly once, first Streamlit command)
 # =====================================================================
 st.set_page_config(
     page_title="ការលេងលើ",
@@ -51,12 +69,13 @@ st.set_page_config(
     initial_sidebar_state="collapsed",
 )
 
-# Auto-refresh every 1 second during quiz
-if "stage" in st.session_state and st.session_state.stage == "quiz":
-    if AUTOREFRESH_AVAILABLE:
-        rerun_if_updated()
-    else:
-        st.set_page_config(layout="centered")
+# Auto-refresh every 1 second while on the quiz screen, so the
+# on-screen timers count down live without needing time.sleep().
+# Uses the REAL streamlit-autorefresh API (st_autorefresh), and is a
+# no-op if the package isn't installed — no second set_page_config
+# call, ever.
+if AUTOREFRESH_AVAILABLE and st.session_state.get("stage") == "quiz":
+    st_autorefresh(interval=1000, key="quiz_timer_tick")
 
 # =====================================================================
 # 2. MOBILE-FIRST CSS
@@ -212,15 +231,15 @@ st.markdown(
 SPREADSHEET_NAME = "Daily Quiz Results"
 QUESTIONS_TAB = "Questions"
 RESULTS_TAB = "Results"
-STUDENTS_TAB = "Students"
+STUDENTS_TAB = "Students"   # optional — app works fine without this tab
 
 GOOGLE_SCOPES = [
     "https://www.googleapis.com/auth/spreadsheets",
     "https://www.googleapis.com/auth/drive",
 ]
 
-GLOBAL_QUIZ_TIME = 900  # 15 minutes
-TIMEZONE = "Asia/Bangkok"
+GLOBAL_QUIZ_TIME = 900  # 15 minutes, in seconds
+TIMEZONE = "Asia/Phnom_Penh"
 
 # =====================================================================
 # 4. GOOGLE SHEETS CONNECTION
@@ -228,7 +247,13 @@ TIMEZONE = "Asia/Bangkok"
 
 @st.cache_resource(show_spinner=False)
 def get_gspread_client():
-    """Get cached gspread client."""
+    """Get a cached, authorized gspread client from st.secrets.
+
+    SETUP: Google Cloud Console -> enable Sheets + Drive API -> create
+    a Service Account -> download its JSON key -> share your Google
+    Sheet with the service account's "client_email" as Editor -> paste
+    the JSON contents into Streamlit Secrets under [gcp_service_account].
+    """
     if not GSPREAD_AVAILABLE:
         return None
     if "gcp_service_account" not in st.secrets:
@@ -246,7 +271,21 @@ def get_gspread_client():
 
 @st.cache_data(ttl=60, show_spinner=False)
 def fetch_question_bank() -> List[Dict]:
-    """Fetch ALL questions from the Questions tab with multi-modal support."""
+    """
+    Fetch ALL questions from the "Questions" tab.
+
+    Matches YOUR sheet layout:
+        Question | Options | Correct Answer
+    "Options" is a single comma-separated cell, e.g. "23, 25, 15, 26".
+
+    Optionally, add a "Type" column (MCQ / WRITING / LISTENING /
+    SPEAKING) to unlock other question types. If "Type" is missing or
+    blank, every row defaults to MCQ (unchanged from your current
+    sheet — no edits required).
+
+    For LISTENING questions, put the audio URL in the "Options" cell
+    instead of comma-separated choices.
+    """
     client = get_gspread_client()
     if client is None:
         return []
@@ -263,19 +302,19 @@ def fetch_question_bank() -> List[Dict]:
         try:
             question = str(row.get("Question", "")).strip()
             q_type = str(row.get("Type", "MCQ")).strip().upper()
-            data = str(row.get("Data/Options", "")).strip()
+            if not q_type:
+                q_type = "MCQ"
+            raw_cell = str(row.get("Options", "")).strip()
             correct_answer = str(row.get("Correct Answer", "")).strip()
 
-            if not question or not q_type:
+            if not question:
                 continue
 
-            # Validate type
             if q_type not in ["MCQ", "WRITING", "LISTENING", "SPEAKING"]:
                 q_type = "MCQ"
 
-            # Process based on type
             if q_type == "MCQ":
-                options = [opt.strip() for opt in data.split(",") if opt.strip()]
+                options = [opt.strip() for opt in raw_cell.split(",") if opt.strip()]
                 if len(options) < 2 or correct_answer not in options:
                     continue
                 bank.append({
@@ -283,34 +322,23 @@ def fetch_question_bank() -> List[Dict]:
                     "type": q_type,
                     "options": options,
                     "answer": correct_answer,
-                    "data": None,
                 })
             elif q_type == "LISTENING":
-                if not data:
+                if not raw_cell:
                     continue
                 bank.append({
                     "question": question,
                     "type": q_type,
-                    "audio_url": data,
+                    "audio_url": raw_cell,
                     "answer": correct_answer,
                     "options": None,
-                    "data": data,
                 })
-            elif q_type == "WRITING":
+            else:  # WRITING or SPEAKING
                 bank.append({
                     "question": question,
                     "type": q_type,
                     "answer": correct_answer if correct_answer else "Teacher Review",
                     "options": None,
-                    "data": None,
-                })
-            elif q_type == "SPEAKING":
-                bank.append({
-                    "question": question,
-                    "type": q_type,
-                    "answer": correct_answer if correct_answer else "Teacher Review",
-                    "options": None,
-                    "data": None,
                 })
         except Exception:
             continue
@@ -320,7 +348,9 @@ def fetch_question_bank() -> List[Dict]:
 
 @st.cache_data(ttl=300, show_spinner=False)
 def fetch_students_roster() -> List[Dict]:
-    """Fetch student roster from Students tab."""
+    """Fetch the optional student roster from a 'Students' tab.
+    Returns [] if the tab doesn't exist — this is expected and fine;
+    the app falls back to manual login in that case."""
     client = get_gspread_client()
     if client is None:
         return []
@@ -354,7 +384,8 @@ def fetch_students_roster() -> List[Dict]:
 
 
 def fetch_today_results() -> List[Dict]:
-    """Fetch today's results from Results tab."""
+    """Fetch today's rows from the Results tab (used for the optional
+    'already attempted today' check when a Students roster is in use)."""
     client = get_gspread_client()
     if client is None:
         return []
@@ -368,7 +399,6 @@ def fetch_today_results() -> List[Dict]:
 
     today = datetime.now(pytz.timezone(TIMEZONE)).strftime("%Y-%m-%d")
     today_results = []
-
     for row in records:
         try:
             timestamp = str(row.get("Timestamp", "")).strip()
@@ -380,77 +410,101 @@ def fetch_today_results() -> List[Dict]:
     return today_results
 
 
-def log_result_to_sheet(student_id: str, student_name: str, student_class: str, 
-                       score: int, total: int) -> bool:
-    """Log quiz result to Results tab."""
+def log_result_to_sheet(student_id: str, student_name: str, student_class: str,
+                         score: int, total: int) -> bool:
+    """Append a result row to the Results tab.
+
+    Auto-detects the existing header so it works whether your Results
+    tab has 4 columns (Timestamp, Student Name, Class, Score — your
+    current sheet) or 5 columns (...with Student ID added). If the
+    Results tab doesn't exist yet, it's created with the 5-column
+    layout including Student ID.
+    """
     client = get_gspread_client()
     if client is None:
         return False
 
     try:
         sheet = client.open(SPREADSHEET_NAME)
-        
+
         try:
             worksheet = sheet.worksheet(RESULTS_TAB)
+            header = worksheet.row_values(1)
         except gspread.exceptions.WorksheetNotFound:
             worksheet = sheet.add_worksheet(title=RESULTS_TAB, rows="1000", cols="5")
-            worksheet.insert_row(["Timestamp", "Student ID", "Student Name", "Class", "Score"], 1)
+            header = ["Timestamp", "Student ID", "Student Name", "Class", "Score"]
+            worksheet.insert_row(header, 1)
 
         tz = pytz.timezone(TIMEZONE)
         timestamp = datetime.now(tz).strftime("%Y-%m-%d %H:%M:%S")
-        worksheet.append_row([timestamp, student_id, student_name, student_class, f"{score}/{total}"])
+        score_str = f"{score}/{total}"
+
+        # Build the row to match whatever columns actually exist,
+        # so we never misalign an existing 4-column sheet.
+        if "Student ID" in header:
+            row = ["" for _ in header]
+            values = {
+                "Timestamp": timestamp,
+                "Student ID": student_id,
+                "Student Name": student_name,
+                "Class": student_class,
+                "Score": score_str,
+            }
+            for col_name, val in values.items():
+                if col_name in header:
+                    row[header.index(col_name)] = val
+            worksheet.append_row(row)
+        else:
+            # Your current 4-column layout: Timestamp, Student Name, Class, Score
+            worksheet.append_row([timestamp, student_name, student_class, score_str])
+
         return True
     except Exception:
         return False
 
 
 # =====================================================================
-# 5. AUTHORIZATION & VERIFICATION
+# 5. OPTIONAL AUTHORIZATION & VERIFICATION (only used if a Students
+#    tab exists — otherwise login.py falls back to manual entry)
 # =====================================================================
 
-def verify_student_attendance(student_id: str) -> Tuple[bool, str]:
-    """Verify if student is Present in roster."""
+def verify_student_attendance(student_id: str) -> Tuple[bool, str, Optional[Dict]]:
+    """Verify if student is 'Present' in the roster."""
     roster = fetch_students_roster()
-    
-    if not roster:
-        return False, "❌ មិនរកឃើញបញ្ជីឈ្មោះនិស្សិត។ សូមព្យាយាមម្តងទៀត។"
-    
+
     student_found = None
     for student in roster:
         if str(student["student_id"]).lower() == str(student_id).lower():
             student_found = student
             break
-    
+
     if student_found is None:
-        return False, f"❌ មិនរកឃើញលេខសម្គាល់ '{student_id}' នៅក្នុងបញ្ជីឈ្មោះ។"
-    
+        return False, f"❌ មិនរកឃើញលេខសម្គាល់ '{student_id}' នៅក្នុងបញ្ជីឈ្មោះ។", None
+
     status_lower = str(student_found["status"]).lower().strip()
     if status_lower != "present":
         return False, (
-            f"⚠️ សូមស្វាគមន៍! អ្នកមិនមាននៅលើបញ្ជីហៅឈ្មោះថ្ងៃនេះទេ។\n\n"
-            f"📋 ស្ថានភាព៖ {student_found['status']}\n\n"
-            f"សូមផលិតមេរៀនរបស់អ្នក ឬឧស្សាហ៍ជម្រាប់។"
-        )
-    
-    return True, ""
+            f"⚠️ អ្នកមិនមាននៅលើបញ្ជីហៅឈ្មោះថ្ងៃនេះទេ។\n\n"
+            f"📋 ស្ថានភាព៖ {student_found['status']}"
+        ), None
+
+    return True, "", student_found
 
 
 def check_today_attempt(student_id: str) -> Tuple[bool, Optional[str]]:
-    """Check if student already tested today. CLEARS CACHE FIRST."""
-    # CRITICAL: Force clear cache to prevent double-attempt bug
-    fetch_today_results.clear()
-    
+    """Check if a student already tested today (roster mode only)."""
+    fetch_today_results.clear()  # force fresh read to avoid a double-attempt race
     today_results = fetch_today_results()
-    
+
     for result in today_results:
         try:
             result_student_id = str(result.get("Student ID", "")).strip()
-            if result_student_id.lower() == str(student_id).lower():
+            if result_student_id and result_student_id.lower() == str(student_id).lower():
                 score = str(result.get("Score", "")).strip()
                 return False, score
         except Exception:
             continue
-    
+
     return True, None
 
 
@@ -459,7 +513,6 @@ def check_today_attempt(student_id: str) -> Tuple[bool, Optional[str]]:
 # =====================================================================
 
 def init_session_state():
-    """Initialize session state variables."""
     if "session_token" not in st.session_state:
         st.session_state.session_token = str(uuid.uuid4())
         st.session_state.stage = "login"
@@ -473,21 +526,24 @@ def init_session_state():
         st.session_state.question_start_time = None
         st.session_state.time_expired = False
         st.session_state.answers = {}
-        st.session_state.show_feedback = False
         st.session_state.logged = False
 
 
 def prepare_quiz_questions() -> bool:
-    """Prepare randomized question set."""
+    """Prepare a randomized question set (uses the full bank as-is;
+    reduce QUESTIONS_PER_ATTEMPT sampling here if you want to limit
+    how many of your sheet's questions appear per attempt)."""
     full_bank = fetch_question_bank()
-    
+
     if not full_bank:
         return False
 
     selected = random.sample(full_bank, len(full_bank))
     st.session_state.quiz_questions = selected
-    st.session_state.quiz_start_time = datetime.now(pytz.timezone(TIMEZONE))
-    st.session_state.question_start_time = st.session_state.quiz_start_time
+    tz = pytz.timezone(TIMEZONE)
+    now = datetime.now(tz)
+    st.session_state.quiz_start_time = now
+    st.session_state.question_start_time = now
     st.session_state.answers = {}
     return True
 
@@ -496,24 +552,24 @@ def get_remaining_times() -> Tuple[int, int, bool]:
     """Calculate remaining global and per-question time."""
     if st.session_state.quiz_start_time is None:
         return GLOBAL_QUIZ_TIME, 0, False
-    
+
     tz = pytz.timezone(TIMEZONE)
     now = datetime.now(tz)
-    
+
     elapsed_global = (now - st.session_state.quiz_start_time).total_seconds()
     global_remaining = max(0, GLOBAL_QUIZ_TIME - elapsed_global)
-    
+
     if global_remaining <= 0:
         return 0, 0, True
-    
+
     total_questions = len(st.session_state.quiz_questions)
     if total_questions == 0:
         return int(global_remaining), 0, False
-    
+
     per_question_limit = GLOBAL_QUIZ_TIME / total_questions
     elapsed_current = (now - st.session_state.question_start_time).total_seconds()
     per_question_remaining = max(0, per_question_limit - elapsed_current)
-    
+
     return int(global_remaining), int(per_question_remaining), False
 
 
@@ -522,89 +578,90 @@ def get_remaining_times() -> Tuple[int, int, bool]:
 # =====================================================================
 
 def render_login_screen():
-    """Login screen with roster verification."""
     st.markdown("<h1 class='quiz-header'>🧠 ការលេងលើ</h1>", unsafe_allow_html=True)
     st.markdown(
-        "<p style='text-align:center; color:#666; font-family: \"Khmer OS\";'>ឆ្លើយសំណួរដើម្បីគាំងសមត្ថភាព។ សូមឈរឱ្យលម្អិត! 💪</p>",
+        "<p style='text-align:center; color:#666; font-family: \"Khmer OS\";'>"
+        "ឆ្លើយសំណួរដើម្បីគាំងសមត្ថភាព។ សូមឈរឱ្យលម្អិត! 💪</p>",
         unsafe_allow_html=True,
     )
     st.divider()
 
     roster = fetch_students_roster()
 
-    with st.form("login_form", clear_on_submit=False):
-        st.write("📋 **ជ្រើសរើសលេខសម្គាល់របស់អ្នក៖**")
-        
-        if roster:
+    if roster:
+        # -------- Roster mode: select from list, verify attendance --------
+        with st.form("login_form_roster", clear_on_submit=False):
+            st.write("📋 **ជ្រើសរើសលេខសម្គាល់របស់អ្នក៖**")
             student_options = [
                 f"{s['student_id']} - {s['full_name']} ({s['class']})"
                 for s in roster
             ]
             selected_option = st.selectbox(
-                "សិស្ស",
-                options=student_options,
-                label_visibility="collapsed"
+                "សិស្ស", options=student_options, label_visibility="collapsed"
             )
             student_id = selected_option.split(" - ")[0] if selected_option else ""
-        else:
-            st.warning("⚠️ មិនរកឃើញបញ្ជីឈ្មោះនិស្សិត។ សូមធានាថាបានដាក់ 'Students' ក្រាប់។")
-            student_id = st.text_input("លេខសម្គាល់", placeholder="ឧ: S001")
-        
-        submitted = st.form_submit_button("ចូលឆ្លើយសំណួរ 🚀", use_container_width=True)
 
-        if submitted:
-            if not student_id or not student_id.strip():
-                st.error("⚠️ សូមជ្រើសរើសលេខសម្គាល់។")
-                return
+            submitted = st.form_submit_button("ចូលឆ្លើយសំណួរ 🚀", use_container_width=True)
 
-            is_authorized, error_msg = verify_student_attendance(student_id.strip())
-            if not is_authorized:
-                st.markdown(
-                    f"<div class='access-denied'>{error_msg}</div>",
-                    unsafe_allow_html=True
-                )
-                return
+            if submitted:
+                if not student_id:
+                    st.error("⚠️ សូមជ្រើសរើសលេខសម្គាល់។")
+                    return
 
-            can_attempt, previous_score = check_today_attempt(student_id.strip())
-            if not can_attempt:
-                st.markdown(
-                    f"<div class='access-denied'>"
-                    f"⚠️ អ្នកបានលេងលើរួចហើយថ្ងៃនេះ។<br><br>"
-                    f"📊 ពិន្ទុលើកមុន៖ <b>{previous_score}</b><br><br>"
-                    f"សូមរង់ចាំថ្ងៃស្អែក ដើម្បីលេងឡើងវិញ។"
-                    f"</div>",
-                    unsafe_allow_html=True
-                )
-                return
+                is_authorized, error_msg, student_info = verify_student_attendance(student_id)
+                if not is_authorized:
+                    st.markdown(f"<div class='access-denied'>{error_msg}</div>", unsafe_allow_html=True)
+                    return
 
-            student_info = None
-            for s in roster:
-                if str(s["student_id"]).lower() == str(student_id).lower():
-                    student_info = s
-                    break
+                can_attempt, previous_score = check_today_attempt(student_id)
+                if not can_attempt:
+                    st.markdown(
+                        f"<div class='access-denied'>"
+                        f"⚠️ អ្នកបានលេងលើរួចហើយថ្ងៃនេះ។<br><br>"
+                        f"📊 ពិន្ទុលើកមុន៖ <b>{previous_score}</b>"
+                        f"</div>",
+                        unsafe_allow_html=True,
+                    )
+                    return
 
-            if student_info:
-                st.session_state.student_id = student_id.strip()
+                st.session_state.student_id = student_id
                 st.session_state.student_name = student_info["full_name"]
                 st.session_state.student_class = student_info["class"]
-            else:
-                st.session_state.student_id = student_id.strip()
-                st.session_state.student_name = student_id.strip()
-                st.session_state.student_class = "មិនលាក់កំបាំង"
+                _start_quiz_after_login()
+    else:
+        # -------- Fallback mode: no "Students" tab yet -> manual entry --------
+        with st.form("login_form_manual", clear_on_submit=False):
+            name = st.text_input("Full Name / ឈ្មោះពេញ", placeholder="e.g. Sophea Chan")
+            student_class = st.text_input("Class / Grade / ថ្នាក់", placeholder="e.g. Grade 10A")
+            submitted = st.form_submit_button("ចូលឆ្លើយសំណួរ 🚀", use_container_width=True)
 
-            with st.spinner("📥 កំពុងទាញយកសំណួរ..."):
-                ok = prepare_quiz_questions()
+            if submitted:
+                if not name.strip() or not student_class.strip():
+                    st.error("⚠️ សូមបំពេញឈ្មោះ និងថ្នាក់របស់អ្នក។")
+                    return
 
-            if not ok:
-                st.error("❌ មិនបានទាញយកសំណួរ។ សូមលេងឡើងវិញ។")
-                return
+                st.session_state.student_id = name.strip()  # no roster ID available
+                st.session_state.student_name = name.strip()
+                st.session_state.student_class = student_class.strip()
+                _start_quiz_after_login()
 
-            st.session_state.stage = "quiz"
-            st.rerun()
+
+def _start_quiz_after_login():
+    with st.spinner("📥 កំពុងទាញយកសំណួរ..."):
+        ok = prepare_quiz_questions()
+
+    if not ok:
+        st.error(
+            "❌ មិនបានទាញយកសំណួរ។ សូមពិនិត្យមើលថា Sheet ឈ្មោះ 'Questions' "
+            "មានជួរឈរ Question / Options / Correct Answer ត្រឹមត្រូវ។"
+        )
+        return
+
+    st.session_state.stage = "quiz"
+    st.rerun()
 
 
 def render_quiz_screen():
-    """Main quiz screen with multi-modal support."""
     questions = st.session_state.quiz_questions
 
     if not questions:
@@ -614,17 +671,15 @@ def render_quiz_screen():
             st.rerun()
         return
 
-    # Check for global timeout
     global_remaining, per_question_remaining, is_expired = get_remaining_times()
 
     if is_expired:
-        # Auto-submit
-        st.session_state.score = 0
+        score = 0
         for i, q in enumerate(questions):
-            if i in st.session_state.answers:
-                answer = st.session_state.answers[i]
-                if q["type"] == "MCQ" and answer == q["answer"]:
-                    st.session_state.score += 1
+            if i in st.session_state.answers and q["type"] == "MCQ":
+                if st.session_state.answers[i] == q["answer"]:
+                    score += 1
+        st.session_state.score = score
         st.session_state.stage = "result"
         st.session_state.time_expired = True
         st.rerun()
@@ -632,29 +687,19 @@ def render_quiz_screen():
     idx = st.session_state.current_q_index
     total = len(questions)
 
-    # Display timers
     col1, col2 = st.columns([1, 1])
     with col1:
-        if global_remaining <= 120:
-            timer_class = "timer-critical" if global_remaining <= 60 else "timer-warning"
-            minutes, seconds = divmod(global_remaining, 60)
-            st.markdown(
-                f"<div class='{timer_class}'>⏱️ សរុប៖ {int(minutes)}:{int(seconds):02d}</div>",
-                unsafe_allow_html=True
-            )
+        minutes, seconds = divmod(global_remaining, 60)
+        if global_remaining <= 60:
+            st.markdown(f"<div class='timer-critical'>⏱️ សរុប៖ {int(minutes)}:{int(seconds):02d}</div>", unsafe_allow_html=True)
+        elif global_remaining <= 120:
+            st.markdown(f"<div class='timer-warning'>⏱️ សរុប៖ {int(minutes)}:{int(seconds):02d}</div>", unsafe_allow_html=True)
         else:
-            minutes, seconds = divmod(global_remaining, 60)
             st.info(f"⏱️ សរុប៖ {int(minutes)}:{int(seconds):02d}")
 
     with col2:
-        if per_question_remaining <= 0:
-            st.markdown(
-                "<div class='timer-critical'>⏳ សំណួរ៖ 0:00</div>",
-                unsafe_allow_html=True
-            )
-        else:
-            minutes, seconds = divmod(per_question_remaining, 60)
-            st.caption(f"⏳ សំណួរ៖ {int(minutes)}:{int(seconds):02d}")
+        minutes, seconds = divmod(per_question_remaining, 60)
+        st.caption(f"⏳ សំណួរ៖ {int(minutes)}:{int(seconds):02d}")
 
     st.progress(idx / total, text=f"សំណួរ {idx + 1} នៃ {total}")
     st.divider()
@@ -662,28 +707,20 @@ def render_quiz_screen():
     q = questions[idx]
     q_type = q["type"]
 
-    # Display question type badge
-    badge_colors = {
-        "MCQ": "#007bff",
-        "WRITING": "#28a745",
-        "LISTENING": "#fd7e14",
-        "SPEAKING": "#e83e8c"
-    }
-    badge_labels = {
-        "MCQ": "ជ្រើសរើស",
-        "WRITING": "សរសេរ",
-        "LISTENING": "ស្តាប់",
-        "SPEAKING": "និយាយ"
-    }
+    badge_colors = {"MCQ": "#007bff", "WRITING": "#28a745", "LISTENING": "#fd7e14", "SPEAKING": "#e83e8c"}
+    badge_labels = {"MCQ": "ជ្រើសរើស", "WRITING": "សរសេរ", "LISTENING": "ស្តាប់", "SPEAKING": "និយាយ"}
+
+    # No backslashes inside f-string expressions — resolve to plain
+    # variables first (this is what caused the earlier SyntaxError).
+    badge_color = badge_colors.get(q_type, "#007bff")
+    badge_label = badge_labels.get(q_type, q_type)
     st.markdown(
-        f"<span class='question-type-badge' style='background-color: {badge_colors.get(q_type, \"#007bff\")};'>"
-        f"{badge_labels.get(q_type, q_type)}</span>",
-        unsafe_allow_html=True
+        f"<span class='question-type-badge' style='background-color: {badge_color};'>{badge_label}</span>",
+        unsafe_allow_html=True,
     )
 
     st.markdown(f"### {q['question']}")
 
-    # Render based on question type
     if q_type == "MCQ":
         render_mcq_question(q, idx)
     elif q_type == "WRITING":
@@ -693,7 +730,6 @@ def render_quiz_screen():
     elif q_type == "SPEAKING":
         render_speaking_question(q, idx)
 
-    # Navigation buttons
     if idx in st.session_state.answers:
         col1, col2 = st.columns([1, 1])
         with col1:
@@ -701,11 +737,12 @@ def render_quiz_screen():
                 if st.button("◀️ ក្រោយ", use_container_width=True):
                     st.session_state.current_q_index -= 1
                     st.rerun()
-        
         with col2:
             if idx + 1 < total:
-                if st.button("លទ្ធផលបន្ទាប់ ▶️", use_container_width=True):
+                if st.button("សំណួរបន្ទាប់ ▶️", use_container_width=True):
                     st.session_state.current_q_index += 1
+                    tz = pytz.timezone(TIMEZONE)
+                    st.session_state.question_start_time = datetime.now(tz)
                     st.rerun()
             else:
                 if st.button("ឈប់លេង ✓", use_container_width=True):
@@ -714,20 +751,15 @@ def render_quiz_screen():
 
 
 def render_mcq_question(q: Dict, idx: int):
-    """Render MCQ question."""
     if idx in st.session_state.answers:
         selected_answer = st.session_state.answers[idx]
         is_correct = selected_answer == q["answer"]
-        
         if is_correct:
-            st.markdown(
-                "<div class='feedback-correct'>✅ ត្រឹមត្រូវ!</div>",
-                unsafe_allow_html=True
-            )
+            st.markdown("<div class='feedback-correct'>✅ ត្រឹមត្រូវ!</div>", unsafe_allow_html=True)
         else:
             st.markdown(
                 f"<div class='feedback-incorrect'>❌ មិនត្រឹមត្រូវ។ ចម្លើយត្រឹមត្រូវ៖ <b>{q['answer']}</b></div>",
-                unsafe_allow_html=True
+                unsafe_allow_html=True,
             )
     else:
         st.write("**ជ្រើសរើសចម្លើយមួយ៖**")
@@ -738,20 +770,13 @@ def render_mcq_question(q: Dict, idx: int):
 
 
 def render_writing_question(q: Dict, idx: int):
-    """Render writing question."""
     if idx in st.session_state.answers:
-        st.markdown(
-            "<div class='feedback-pending'>📝 ចម្លើយរបស់អ្នក៖ (គ្រូនឹងវាយតម្លៃ)</div>",
-            unsafe_allow_html=True
-        )
+        st.markdown("<div class='feedback-pending'>📝 ចម្លើយរបស់អ្នក៖ (គ្រូនឹងវាយតម្លៃ)</div>", unsafe_allow_html=True)
         st.text_area("ចម្លើយរបស់អ្នក:", value=st.session_state.answers[idx], disabled=True)
     else:
         st.write("**សូមសរសេរចម្លើយលម្អិត៖**")
         answer_text = st.text_area(
-            "ទម្រង់ត្រឹម",
-            placeholder="សូមសរសេរចម្លើយលម្អិត...",
-            height=150,
-            label_visibility="collapsed"
+            "ចម្លើយ", placeholder="សូមសរសេរចម្លើយលម្អិត...", height=150, label_visibility="collapsed"
         )
         if answer_text.strip():
             if st.button("រក្សាទុក ✓", use_container_width=True):
@@ -760,9 +785,7 @@ def render_writing_question(q: Dict, idx: int):
 
 
 def render_listening_question(q: Dict, idx: int):
-    """Render listening question with audio player."""
     audio_url = q.get("audio_url", "")
-    
     if audio_url:
         st.write("**ស្តាប់ឯកសារ៖**")
         st.audio(audio_url)
@@ -770,19 +793,12 @@ def render_listening_question(q: Dict, idx: int):
         st.warning("⚠️ មិនរកឃើញឯកសារជម្រើស។")
 
     st.write("**សូមឆ្លើយសំណួរខាងលើ៖**")
-    
     if idx in st.session_state.answers:
-        st.markdown(
-            "<div class='feedback-pending'>📝 ចម្លើយរបស់អ្នក៖ (គ្រូនឹងវាយតម្លៃ)</div>",
-            unsafe_allow_html=True
-        )
+        st.markdown("<div class='feedback-pending'>📝 ចម្លើយរបស់អ្នក៖ (គ្រូនឹងវាយតម្លៃ)</div>", unsafe_allow_html=True)
         st.text_area("ចម្លើយរបស់អ្នក:", value=st.session_state.answers[idx], disabled=True)
     else:
         answer_text = st.text_area(
-            "ទម្រង់ត្រឹម",
-            placeholder="សូមសរសេរសម្ព័ន្ធ...",
-            height=100,
-            label_visibility="collapsed"
+            "ចម្លើយ", placeholder="សូមសរសេរចម្លើយ...", height=100, label_visibility="collapsed"
         )
         if answer_text.strip():
             if st.button("រក្សាទុក ✓", use_container_width=True):
@@ -791,16 +807,11 @@ def render_listening_question(q: Dict, idx: int):
 
 
 def render_speaking_question(q: Dict, idx: int):
-    """Render speaking question with mic recorder."""
     if idx in st.session_state.answers:
-        st.markdown(
-            "<div class='feedback-pending'>🎤 ឯកសារថ្នល់របស់អ្នក៖ (គ្រូនឹងវាយតម្លៃ)</div>",
-            unsafe_allow_html=True
-        )
-        st.info("✅ ឯកសាររឹងបានរក្សាទុក។ សូមបន្តទៅសំណួរបន្ទាប់។")
+        st.markdown("<div class='feedback-pending'>🎤 ឯកសារថ្នល់របស់អ្នក៖ (គ្រូនឹងវាយតម្លៃ)</div>", unsafe_allow_html=True)
+        st.info("✅ ចម្លើយបានរក្សាទុក។ សូមបន្តទៅសំណួរបន្ទាប់។")
     else:
-        st.write("**សូមថ្នល់ចម្លើយ៖**")
-        
+        st.write("**សូមឆ្លើយចម្លើយ៖**")
         if MIC_RECORDER_AVAILABLE:
             try:
                 audio_data = mic_recorder(
@@ -808,25 +819,19 @@ def render_speaking_question(q: Dict, idx: int):
                     stop_prompt="⏹️ ឈប់ថ្នល់",
                     just_once=False,
                     use_container_width=True,
-                    key=f"mic_{idx}"
+                    key=f"mic_{idx}",
                 )
-                
                 if audio_data is not None:
-                    # Process audio
-                    st.success("✅ ឯកសារបានលាប់។ សូមរក្សាទុក។")
+                    st.success("✅ ឯកសារបានថ្នល់។ សូមរក្សាទុក។")
                     if st.button("រក្សាទុក ✓", use_container_width=True):
-                        # Store as base64 placeholder
                         st.session_state.answers[idx] = "[AUDIO_RECORDED]"
                         st.rerun()
             except Exception as e:
-                st.warning(f"⚠️ មិនអាចកត់ត្រាឯកសារ៖ {str(e)}")
+                st.warning(f"⚠️ មិនអាចថ្នល់សំឡេង៖ {str(e)}")
         else:
-            st.warning("⚠️ មិនមាន mic-recorder plugin។ សូមផ្តល់ឯកសារ text ប្រឆាំង។")
+            st.info("🎤 mic-recorder មិនត្រូវបានដំឡើងទេ — សូមសរសេរចម្លើយជំនួសវិញ។")
             answer_text = st.text_area(
-                "ទម្រង់ត្រឹម",
-                placeholder="សូមសរសេរច្រើនលម្អិត...",
-                height=100,
-                label_visibility="collapsed"
+                "ចម្លើយ", placeholder="សូមសរសេរចម្លើយ...", height=100, label_visibility="collapsed"
             )
             if answer_text.strip():
                 if st.button("រក្សាទុក ✓", use_container_width=True):
@@ -835,18 +840,16 @@ def render_speaking_question(q: Dict, idx: int):
 
 
 def render_result_screen():
-    """Results screen with score display."""
     questions = st.session_state.quiz_questions
     total = len(questions)
-    
-    # Calculate final score (only MCQ counted as auto-graded)
+
     score = 0
     for i, q in enumerate(questions):
         if i in st.session_state.answers and q["type"] == "MCQ":
             if st.session_state.answers[i] == q["answer"]:
                 score += 1
-
     st.session_state.score = score
+
     st.balloons()
     st.markdown("<h1 class='quiz-header'>🎉 រៀបចំលើរួច!</h1>", unsafe_allow_html=True)
 
@@ -854,23 +857,22 @@ def render_result_screen():
     if st.session_state.get("time_expired", False):
         time_expired_msg = (
             "<p style='color:#d32f2f; font-weight:600; font-family: \"Khmer OS\";'>"
-            "⏰ អស់ពេល។ លទ្ធផលត្រូវបានរំលឹក។"
-            "</p>"
+            "⏰ អស់ពេល។ លទ្ធផលត្រូវបានរំលឹក។</p>"
         )
 
     st.markdown(
         f"""
         <div style='text-align:center; padding: 1.5rem; background:#f0f2f6;
                     border-radius: 14px; margin-top: 1rem;'>
-            <p style='font-size:1.1rem; margin-bottom:0.3rem; font-family: \"Khmer OS\";'>
+            <p style='font-size:1.1rem; margin-bottom:0.3rem; font-family: "Khmer OS";'>
                 {st.session_state.student_name} ({st.session_state.student_class})
             </p>
             <p style='font-size:2.2rem; font-weight:700; margin:0;'>
                 {score} / {total}
             </p>
             {time_expired_msg}
-            <p style='font-size:0.9rem; color:#666; margin-top:0.5rem; font-family: \"Khmer OS\";'>
-                (សំណួរលម្អិត ឬ ថ្នល់នឹងមាន ដោយគ្រូ)
+            <p style='font-size:0.9rem; color:#666; margin-top:0.5rem; font-family: "Khmer OS";'>
+                (សំណួរសរសេរ ឬ ថ្នល់នឹងវាយតម្លៃដោយគ្រូ)
             </p>
         </div>
         """,
@@ -887,22 +889,15 @@ def render_result_screen():
         )
         st.session_state.logged = True
         if success:
-            st.markdown(
-                "<div class='success-box'>✅ លទ្ធផលបានរក្សាទុក។ សូមបិទបង្អួច។</div>",
-                unsafe_allow_html=True
-            )
+            st.markdown("<div class='success-box'>✅ លទ្ធផលបានរក្សាទុក។ សូមបិទបង្អួច។</div>", unsafe_allow_html=True)
         else:
-            st.warning(f"⚠️ មិនបានរក្សាទុក។ សូមប្រាប់គ្រូ៖ {score}/{total}")
+            st.warning(f"⚠️ មិនបានរក្សាទុកទេ។ សូមប្រាប់គ្រូ៖ {score}/{total}")
     else:
-        st.markdown(
-            "<div class='success-box'>✅ លទ្ធផលបានរក្សាទុក។</div>",
-            unsafe_allow_html=True
-        )
+        st.markdown("<div class='success-box'>✅ លទ្ធផលបានរក្សាទុក។</div>", unsafe_allow_html=True)
 
     st.divider()
     st.caption(
-        "💡 ប្រសិនបើលោកអ្នកបើក link ឡើងវិញ វានឹងបង្ហាញថា "
-        "លោកអ្នកបានលេងលើថ្ងៃនេះរួចហើយ។"
+        "💡 ប្រសិនបើលោកអ្នកបើក link ឡើងវិញ វានឹងចាប់ផ្តើមការធ្វើតេស្តថ្មីមួយ។"
     )
 
 
@@ -911,9 +906,7 @@ def render_result_screen():
 # =====================================================================
 
 def main():
-    """Main application entry point."""
     init_session_state()
-    
     stage = st.session_state.get("stage", "login")
 
     if stage == "login":
