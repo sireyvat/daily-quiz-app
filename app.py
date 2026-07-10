@@ -492,8 +492,9 @@ def verify_student_attendance(student_id: str) -> Tuple[bool, str, Optional[Dict
 
 
 def check_today_attempt(student_id: str) -> Tuple[bool, Optional[str]]:
-    """Check if a student already tested today (roster mode only)."""
-    fetch_today_results.clear()  # force fresh read to avoid a double-attempt race
+    """Check if a student already tested today (roster mode only).
+    fetch_today_results() is NOT cached, so it already reads the
+    Results tab live on every call — no .clear() needed/possible."""
     today_results = fetch_today_results()
 
     for result in today_results:
