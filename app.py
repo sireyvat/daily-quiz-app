@@ -394,7 +394,6 @@ def prepare_quiz_questions():
     if not full_bank:
         return False
 
-    # Use all questions or limit if too many
     n = len(full_bank)
     selected = random.sample(full_bank, n)
     prepared = []
@@ -425,14 +424,12 @@ def get_remaining_times() -> Tuple[int, int, bool]:
     tz = pytz.timezone(TIMEZONE)
     now = datetime.now(tz)
     
-    # Global time elapsed
     elapsed_global = (now - st.session_state.quiz_start_time).total_seconds()
     global_remaining = max(0, GLOBAL_QUIZ_TIME - elapsed_global)
     
     if global_remaining <= 0:
         return 0, 0, True
     
-    # Per-question time
     total_questions = len(st.session_state.quiz_questions)
     per_question_limit = GLOBAL_QUIZ_TIME / max(1, total_questions)
     
@@ -483,7 +480,7 @@ def render_login_screen():
             )
             student_id = student_options[selected_option] if selected_option else ""
         else:
-            st.warning("⚠️ មិនរកឃើញ Roster។ សូមដាក់ 'Students' tab ដែលមាន।")
+            st.warning("⚠️ មិនរកឃើញ Roster។ សូមដាក់ 'Students' tab ដែលមាន។")
             student_id = st.text_input("Student ID", placeholder="ឧ: S001")
         
         submitted = st.form_submit_button("ចូលតេស្ត 🚀", use_container_width=True)
@@ -493,7 +490,6 @@ def render_login_screen():
                 st.error("⚠️ សូមជ្រើសរើស Student ID។")
                 return
 
-            # Verify attendance
             is_authorized, error_msg = verify_student_attendance(student_id.strip())
             if not is_authorized:
                 st.markdown(
@@ -502,7 +498,6 @@ def render_login_screen():
                 )
                 return
 
-            # Check today's attempt
             can_attempt, previous_score = check_today_attempt(student_id.strip())
             if not can_attempt:
                 st.markdown(
@@ -515,7 +510,6 @@ def render_login_screen():
                 )
                 return
 
-            # Find student details from roster
             student_info = None
             for s in roster:
                 if s["student_id"].lower() == student_id.lower():
@@ -553,10 +547,8 @@ def render_quiz_screen():
             st.rerun()
         return
 
-    # Get remaining times
     global_remaining, per_question_remaining, is_expired = get_remaining_times()
 
-    # Handle global timeout
     if is_expired:
         st.session_state.stage = "result"
         st.session_state.time_expired = True
@@ -565,8 +557,7 @@ def render_quiz_screen():
     idx = st.session_state.current_q_index
     total = len(questions)
 
-    # Display global timer
-    if global_remaining <= 120:  # 2 minutes left
+    if global_remaining <= 120:
         timer_class = "timer-critical" if global_remaining <= 60 else "timer-warning"
         minutes, seconds = divmod(global_remaining, 60)
         st.markdown(
@@ -579,11 +570,9 @@ def render_quiz_screen():
     q = questions[idx]
     st.markdown(f"### {q['question']}")
     
-    # Display per-question timer
     minutes, seconds = divmod(per_question_remaining, 60)
     st.caption(f"⏳ ពេលលេងសម្រាប់សំណួរនេះ: {int(minutes)}:{int(seconds):02d}")
 
-    # Auto-fail if per-question time expires
     if per_question_remaining <= 0 and not st.session_state.answered_current:
         st.session_state.answered_current = True
         st.session_state.last_answer_correct = False
@@ -619,7 +608,6 @@ def render_quiz_screen():
                 unsafe_allow_html=True,
             )
 
-        # Auto-advance after feedback
         import time
         time.sleep(1.5)
 
@@ -678,7 +666,7 @@ def render_result_screen():
         if success:
             st.success("✅ លទ្ធផលរបស់អ្នកបានរក្សាទុក។ សូមបិទបង្អួចនេះ។")
         else:
-            st.info("⚠️ លទ្ធផលមិនបាន រក្សាទុកដោយស្វ័ង့ទេ។ សូមប្រាប់គ្រូ៖ " + str(score) + "/" + str(total))
+            st.info("⚠️ លទ្ធផលមិនបាន រក្សាទុកដោយស្វ័ង់ទេ។ សូមប្រាប់គ្រូ៖ " + str(score) + "/" + str(total))
     else:
         st.success("✅ លទ្ធផលបានរក្សាទុក។ សូមបិទបង្អួច។")
 
