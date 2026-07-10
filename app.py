@@ -356,9 +356,13 @@ def check_today_attempt(student_id: str) -> Tuple[bool, Optional[str]]:
     today_results = fetch_today_results()
     
     for result in today_results:
-        if result.get("Student ID", "").strip().lower() == student_id.lower():
-            score = result.get("Score", "")
-            return False, score
+        try:
+            result_student_id = str(result.get("Student ID", "")).strip()
+            if result_student_id.lower() == student_id.lower():
+                score = str(result.get("Score", "")).strip()
+                return False, score
+        except Exception:
+            continue
     
     return True, None
 
